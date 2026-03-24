@@ -76,4 +76,15 @@ def render_sidebar():
     if time_from is not None and time_to is not None and time_from > time_to:
         st.sidebar.error("Start time cannot be after end time. Please correct the selection.")
 
-    return selected_city, show_graphs, show_full_data, date_from, date_to, time_from, time_to
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### Detection Method")
+
+    # Algorithm selection dropdown
+    algorithm = st.sidebar.selectbox(
+        "Select Detection Method",
+        ["Isolation Forest", "KMeans", "Hybrid"],
+        index=2,  # Default to Hybrid
+        key="algorithm"
+    )
+
+    return selected_city, show_graphs, show_full_data, date_from, date_to, time_from, time_to, algorithm

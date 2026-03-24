@@ -10,6 +10,9 @@ from components.charts import (
     get_humidity_plot,
     get_scatter_plot,
     get_anomaly_scatter_plot,
+    get_anomaly_percentage_pie_chart,
+    get_cluster_scatter_plot,
+    get_final_anomaly_plot,
 )
 from config import DEFAULT_HEAD_ROWS
 
@@ -30,7 +33,7 @@ st.markdown(
 st.title("Weather Anomaly Detection Dashboard")
 
 # Render sidebar
-selected_city, show_graphs, show_full_data, date_from, date_to, time_from, time_to = render_sidebar()
+selected_city, show_graphs, show_full_data, date_from, date_to, time_from, time_to, algorithm = render_sidebar()
 
 if selected_city:
     # Add file-modified time as extra cache key to avoid stale caching when parquet is reprocessed.
@@ -62,17 +65,34 @@ if selected_city:
 
         # Top meta / KPIs
         counts = df.shape[0]
-        anomaly_counts = int(df["anomaly"].value_counts().get(-1, 0)) if "anomaly" in df.columns else 0
-        normal_counts = int(df["anomaly"].value_counts().get(1, 0)) if "anomaly" in df.columns else counts - anomaly_counts
-        avg_temp = df["temperature"].mean() if "temperature" in df.columns else None
-        avg_hum = df["humidity"].mean() if "humidity" in df.columns else None
 
-        kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+        # Determine anomaly counts based on selected algorithm
+        if algorithm == "Isolation Forest":
+            anomaly_col = "anomaly"
+        elif algorithm == "KMeans":
+            anomaly_col = "cluster_anomaly"
+        else:  # Hybrid
+            anomaly_col = "final_anomaly"
+
+        anomaly_counts = int(df[anomaly_col].value_counts().get(-1, 0)) if anomaly_col in df.columns else 0
+        normal_counts = int(df[anomaly_col].value_counts().get(1, 0)) if anomaly_col in df.columns else counts - anomaly_counts
+
+        possible_temp_cols = ["temperature", "tempC", "tempc", "temp"]
+        possible_hum_cols = ["humidity", "hum"]
+        temp_col_avg = next((c for c in possible_temp_cols if c in df.columns), None)
+        hum_col_avg = next((c for c in possible_hum_cols if c in df.columns), None)
+
+        avg_temp = df[temp_col_avg].mean() if temp_col_avg is not None else None
+        avg_hum = df[hum_col_avg].mean() if hum_col_avg is not None else None
+        n_clusters = df["cluster"].nunique() if "cluster" in df.columns else 0
+
+        kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
         kpi1.metric("Total records", f"{counts:,}")
         kpi2.metric("Normal points", f"{normal_counts:,}")
         kpi3.metric("Anomalies", f"{anomaly_counts:,}")
-        kpi4.metric("Avg temperature", f"{avg_temp:.2f}" if avg_temp is not None else "N/A")
-        kpi5.metric("Avg humidity", f"{avg_hum:.2f}" if avg_hum is not None else "N/A")
+        kpi4.metric("Avg temperature" if avg_temp is not None else "Temperature", f"{avg_temp:.2f}°C" if avg_temp is not None else "N/A")
+        kpi5.metric("Avg humidity" if avg_hum is not None else "Humidity", f"{avg_hum:.2f}%" if avg_hum is not None else "N/A")
+        kpi6.metric("Clusters", f"{n_clusters}")
 
         st.markdown("---")
 
@@ -82,9 +102,14 @@ if selected_city:
 
         with col1:
             st.markdown("**Preview**")
-            st.dataframe(df.head(DEFAULT_HEAD_ROWS))
+            preview_rows = 8  # Ensure preview table matches the number of rows in summary statistics
+            preview_df = df.head(preview_rows).copy()
+            preview_df.index = range(1, len(preview_df) + 1)
+            st.dataframe(preview_df)
             if show_full_data:
-                st.dataframe(df)
+                full_df = df.copy()
+                full_df.index = range(1, len(full_df) + 1)
+                st.dataframe(full_df)
 
         with col2:
             st.markdown("**Summary Statistics**")
@@ -121,30 +146,57 @@ if selected_city:
                     if humidity_fig is not None:
                         st.plotly_chart(humidity_fig, use_container_width=True)
 
-                # scatter and anomaly side-by-side with equal width
-                c3, c4 = st.columns([1, 1])
-                with c3:
-                    st.subheader("Temperature vs Humidity")
-                    scatter_fig = get_scatter_plot(temp_col, hum_col, temp_series, hum_series, selected_city)
-                    if scatter_fig is not None:
-                        st.plotly_chart(scatter_fig, use_container_width=True)
-
-                st.markdown("---")
+                # scatter plot full width
+                st.subheader("Temperature vs Humidity")
+                scatter_fig = get_scatter_plot(temp_col, hum_col, temp_series, hum_series, selected_city)
+                if scatter_fig is not None:
+                    st.plotly_chart(scatter_fig, use_container_width=True)
 
                 if "anomaly" in df.columns:
-                    with c4:
-                        st.subheader("Anomaly Scan")
+                    st.subheader(f"Anomaly Scan ({algorithm})")
+
+                    # Show different visualizations based on algorithm
+                    if algorithm == "Isolation Forest":
+                        anomaly_series = tuple(trimmed["anomaly"].map({1: 'Normal', -1: 'Anomaly'}).fillna('Normal').tolist())
                         anomaly_fig = get_anomaly_scatter_plot(temp_col, hum_col, temp_series, hum_series, anomaly_series, selected_city)
                         if anomaly_fig is not None:
                             st.plotly_chart(anomaly_fig, use_container_width=True)
-                        st.metric("Normal count", f"{normal_counts:,}")
-                        st.metric("Anomaly count", f"{anomaly_counts:,}")
-                        st.caption("Anomalies marked by IsolationForest: -1 = anomaly, 1 = normal")
+                        st.caption("Anomalies marked by Isolation Forest: -1 = anomaly, 1 = normal")
 
-                        st.markdown("#### Anomaly sample rows")
-                        anomaly_rows = trimmed[trimmed["anomaly"] == -1]
+                    elif algorithm == "KMeans":
+                        if "cluster" in trimmed.columns:
+                            cluster_series = tuple(trimmed["cluster"].tolist())
+                            cluster_fig = get_cluster_scatter_plot(temp_col, hum_col, temp_series, hum_series, cluster_series, selected_city)
+                            if cluster_fig is not None:
+                                st.plotly_chart(cluster_fig, use_container_width=True)
+                            st.caption("Small clusters (anomalous) are marked as anomalies")
+
+                    else:  # Hybrid
+                        if "final_anomaly" in trimmed.columns:
+                            final_anomaly_series = tuple(trimmed["final_anomaly"].tolist())
+                            final_fig = get_final_anomaly_plot(temp_col, hum_col, temp_series, hum_series, final_anomaly_series, selected_city)
+                            if final_fig is not None:
+                                st.plotly_chart(final_fig, use_container_width=True)
+                            st.caption("Hybrid anomalies: Isolation Forest OR small cluster anomalies")
+
+                    # Display anomaly sample rows and pie chart side-by-side full width
+                    table_col, pie_col = st.columns([1.5, 1.2])
+
+                    with table_col:
+                        st.markdown("#### Anomaly Sample Rows")
+                        # Use the appropriate anomaly column based on algorithm
+                        anomaly_col = "anomaly" if algorithm == "Isolation Forest" else ("cluster_anomaly" if algorithm == "KMeans" else "final_anomaly")
+                        anomaly_rows = trimmed[trimmed[anomaly_col] == -1]
                         if not anomaly_rows.empty:
                             display_cols = [c for c in ["date", temp_col, hum_col, "wind_speed", "temp_change", "humidity_change", "is_anomaly"] if c in anomaly_rows.columns]
-                            st.dataframe(anomaly_rows[display_cols].head(10).reset_index(drop=True))
+                            anomaly_sample_df = anomaly_rows[display_cols].head(10).copy()
+                            anomaly_sample_df.index = range(1, len(anomaly_sample_df) + 1)
+                            st.dataframe(anomaly_sample_df, use_container_width=True)
                         else:
                             st.write("No anomaly rows in the plotted subset.")
+
+                    with pie_col:
+                        # Display pie chart for anomaly distribution
+                        pie_fig = get_anomaly_percentage_pie_chart(normal_counts, anomaly_counts, selected_city)
+                        if pie_fig is not None:
+                            st.plotly_chart(pie_fig, use_container_width=True)
