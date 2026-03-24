@@ -1,219 +1,150 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from pathlib import Path
-from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import StandardScaler
+from components.sidebar import render_sidebar
+from utils.loader import load_data
+
+st.set_page_config(page_title="Weather Anomaly Dashboard", layout="wide")
+from components.charts import (
+    get_plot_columns,
+    get_temperature_plot,
+    get_humidity_plot,
+    get_scatter_plot,
+    get_anomaly_scatter_plot,
+)
+from config import DEFAULT_HEAD_ROWS
+
+st.markdown(
+    """
+    <style>
+    .stApp > header {visibility: hidden;}
+    .css-18e3th9 {padding-top: 0rem;}
+    .css-1outpf7 {padding-top: 1rem;}
+    .css-1d391kg {max-width: 95%; margin: 0 auto;}
+    .css-1lcbmhc {max-width: 95%; margin: 0 auto;}
+    .streamlit-expanderHeader {font-weight: 800; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.title("Weather Anomaly Detection Dashboard")
 
-# dataset folder (relative to this file)
-DATA_DIR = Path(__file__).resolve().parent / "dataset"
+# Render sidebar
+selected_city, show_graphs, show_full_data, date_from, date_to, time_from, time_to = render_sidebar()
 
-# helper to list the available dataset CSVs
-# (the app was previously using a single static file; now we load from a set of CSVs)
-def list_dataset_files(exclude=None):
-    exclude = set(exclude or [])
-    if not DATA_DIR.exists():
-        return []
-    files = sorted(DATA_DIR.glob("*.csv"))
-    return [p for p in files if p.name not in exclude]
+if selected_city:
+    # Add file-modified time as extra cache key to avoid stale caching when parquet is reprocessed.
+    from pathlib import Path
+    from config import PROCESSED_DATA_PATH
 
-# helper to load a dataset path
-def load_csv(path: Path):
-    try:
-        return pd.read_csv(path)
-    except Exception as e:  # includes EmptyDataError, FileNotFoundError
-        st.warning(f"Unable to load {path.name}: {e}")
-        return pd.DataFrame()
+    parquet_file = PROCESSED_DATA_PATH / f"{selected_city.lower()}.parquet"
+    data_mtime = parquet_file.stat().st_mtime if parquet_file.exists() else 0
 
-# choose which dataset to use
-available_files = list_dataset_files(exclude={"weather.csv", "open-meteo-52.55N13.41E38m.csv"})
-if not available_files:
-    st.warning("No dataset CSVs found in the dataset folder. Please add dataset files.")
-    base_df = pd.DataFrame()
-else:
-    dataset_names = ["All datasets"] + [p.name for p in available_files]
-    selected = st.selectbox("Select dataset", dataset_names, index=0)
-    if selected == "All datasets":
-        # concatenate all available datasets into one DataFrame
-        dfs = [load_csv(p) for p in available_files]
-        base_df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-    else:
-        base_df = load_csv(DATA_DIR / selected)
+    # Load data directly (cached internally)
+    df = load_data(selected_city, data_mtime)
 
-# simple preprocessing for uploaded files (normalize column names, types)
-def preprocess_df(df):
     if df.empty:
-        return df
-    # lowercase and strip spaces from column names
-    df = df.rename(columns=lambda c: c.strip().lower())
-    # attempt to convert all columns to numeric where possible
-    for col in df.columns:
-        try:
-            df[col] = pd.to_numeric(df[col], errors='ignore')
-        except Exception:
-            pass
-    # fill NaNs with 0 for numeric columns
-    nums = df.select_dtypes(include=[np.number]).columns
-    df[nums] = df[nums].fillna(0)
-    return df
-
-# main data-loading logic
-# always start with the selected dataset (from the dataset folder)
-default_dataset_name = selected if available_files else None
-
-uploaded_file = st.file_uploader("(optional) Upload a custom weather CSV", type=["csv"])
-use_uploaded = False
-if uploaded_file:
-    try:
-        uploaded_file.seek(0)
-        temp = pd.read_csv(uploaded_file)
-        temp = preprocess_df(temp)
-        if not temp.empty:
-            use_uploaded = True
-            df = temp
-        else:
-            st.error("Uploaded file appears to be empty after preprocessing; using dataset selection instead.")
-            df = base_df
-    except Exception as e:
-        st.error(f"Unable to parse uploaded file: {e}; using selected dataset.")
-        df = base_df
-else:
-    df = base_df
-
-if use_uploaded:
-    st.info("Using data from uploaded file (preprocessed).")
-else:
-    if default_dataset_name:
-        st.info(f"Using dataset: {default_dataset_name}")
+        st.error("No data available for selected city.")
     else:
-        st.info("No dataset available. Upload a CSV or add dataset files to the dataset folder.")
+        # Convert date column to datetime if present
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors='coerce')
 
-if df.empty:
-    st.warning("No data available. Please upload a valid weather CSV file or add datasets to the dataset folder.")
-else:
-    # use city names as index when available
-    if "city" in df.columns:
-        df = df.set_index("city")
+        # Apply user-selected date filter
+        if date_from is not None and date_to is not None and "date" in df.columns:
+            start_date = pd.to_datetime(date_from)
+            end_date = pd.to_datetime(date_to)
+            df = df[(df["date"] >= start_date) & (df["date"] <= end_date)]
 
-    # ---------------------------------------------------------
-    # Section 1 — Dataset Overview
-    # ---------------------------------------------------------
-    st.header("1. Dataset Overview")
-    st.subheader("Preview")
-    st.dataframe(df.head())
-    if st.checkbox("Show raw data"):
-        st.dataframe(df)
+        # Apply user-selected time filter
+        if time_from is not None and time_to is not None and "date" in df.columns:
+            df = df[df["date"].dt.time.between(time_from, time_to)]
 
-    st.subheader("Summary Statistics")
-    st.write(df.describe())
+        # Top meta / KPIs
+        counts = df.shape[0]
+        anomaly_counts = int(df["anomaly"].value_counts().get(-1, 0)) if "anomaly" in df.columns else 0
+        normal_counts = int(df["anomaly"].value_counts().get(1, 0)) if "anomaly" in df.columns else counts - anomaly_counts
+        avg_temp = df["temperature"].mean() if "temperature" in df.columns else None
+        avg_hum = df["humidity"].mean() if "humidity" in df.columns else None
 
-    # ---------------------------------------------------------
-    # Section 2 — Weather Analysis
-    # ---------------------------------------------------------
-    st.header("2. Weather Analysis")
-    if "temperature" in df.columns:
-        st.subheader("Temperature Trend")
-        st.line_chart(df["temperature"])
-    if "humidity" in df.columns:
-        st.subheader("Humidity Trend")
-        st.line_chart(df["humidity"])
+        kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+        kpi1.metric("Total records", f"{counts:,}")
+        kpi2.metric("Normal points", f"{normal_counts:,}")
+        kpi3.metric("Anomalies", f"{anomaly_counts:,}")
+        kpi4.metric("Avg temperature", f"{avg_temp:.2f}" if avg_temp is not None else "N/A")
+        kpi5.metric("Avg humidity", f"{avg_hum:.2f}" if avg_hum is not None else "N/A")
 
-    # distribution plots for numeric variables
-    st.subheader("Distribution of Numeric Features")
-    nums = df.select_dtypes(include=[np.number]).columns.tolist()
-    if nums:
-        fig_dist, axes = plt.subplots(len(nums), 1, figsize=(8, 3*len(nums)))
-        if len(nums) == 1:
-            axes = [axes]
-        for ax, col in zip(axes, nums):
-            sns.histplot(df[col], kde=True, ax=ax)
-            ax.set_title(col)
-        st.pyplot(fig_dist)
+        st.markdown("---")
 
-    # ---------------------------------------------------------
-    # Section 3 — Feature Relationships
-    # ---------------------------------------------------------
-    st.header("3. Feature Relationships")
-    st.subheader("Correlation Heatmap")
-    corr = df.select_dtypes(include=[np.number]).corr()
-    fig, ax = plt.subplots(figsize=(12, 10))
-    sns.heatmap(corr, annot=True, cmap="coolwarm", ax=ax)
-    st.pyplot(fig)
+        # Dataset overview
+        st.subheader("Dataset Overview")
+        col1, col2 = st.columns([1, 1])
 
-    # scatter example (temperature vs humidity)
-    if "temperature" in df.columns and "humidity" in df.columns:
-        st.subheader("Temperature vs Humidity")
-        fig_sc, ax_sc = plt.subplots(figsize=(10,6))
-        ax_sc.scatter(df["temperature"], df["humidity"], alpha=0.6)
-        # annotate each point with city name (index)
-        for city, row in df.iterrows():
-            ax_sc.text(row["temperature"], row["humidity"], str(city), fontsize=7)
-        ax_sc.set_xlabel("Temperature")
-        ax_sc.set_ylabel("Humidity")
-        st.pyplot(fig_sc)
+        with col1:
+            st.markdown("**Preview**")
+            st.dataframe(df.head(DEFAULT_HEAD_ROWS))
+            if show_full_data:
+                st.dataframe(df)
 
-    # ---------------------------------------------------------
-    # Section 4 — Anomaly Detection
-    # ---------------------------------------------------------
-    st.header("4. Anomaly Detection")
-    if st.checkbox("Run anomaly detection"):
-        with st.spinner("Computing anomalies..."):
-            features = df.select_dtypes(include=[np.number])
-            scaler = StandardScaler()
-            scaled = scaler.fit_transform(features.fillna(0))
-            model = IsolationForest(contamination=0.05, random_state=42)
-            df["anomaly"] = model.fit_predict(scaled)
+        with col2:
+            st.markdown("**Summary Statistics**")
+            st.dataframe(df.describe())
 
-        # display using metrics to avoid repetition later
-        counts = df["anomaly"].value_counts().rename(index={1:"normal", -1:"anomaly"})
-        st.metric("Normal points", counts.get(1,0))
-        st.metric("Anomalous points", counts.get(-1,0))
+        st.markdown("---")
 
-        st.subheader("Anomaly Scatter (temp vs humidity)")
-        if "temperature" in df.columns and "humidity" in df.columns:
-            fig2, ax2 = plt.subplots(figsize=(10,6))
-            ax2.scatter(df["temperature"], df["humidity"], c=df["anomaly"], cmap="coolwarm")
-            # label points with city
-            for city, row in df.iterrows():
-                ax2.text(row["temperature"], row["humidity"], str(city), fontsize=7)
-            ax2.set_xlabel("Temperature")
-            ax2.set_ylabel("Humidity")
-            st.pyplot(fig2)
+        if show_graphs:
+            st.header("Weather Analysis")
 
-        st.subheader("Anomaly Timeline (temperature)")
-        if "temperature" in df.columns:
-            fig3, ax3 = plt.subplots(figsize=(12,5))
-            # if index is city, plot will use it on x-axis automatically
-            ax3.plot(df["temperature"], label="Temperature")
-            anomalies = df[df["anomaly"] == -1]
-            ax3.scatter(anomalies.index, anomalies["temperature"], color="red", label="Anomaly")
-            ax3.legend()
-            st.pyplot(fig3)
+            # Keep plotting data small for speed
+            trimmed = df.tail(2000).reset_index(drop=True)
+            temp_col, hum_col = get_plot_columns(trimmed)
 
-    # ---------------------------------------------------------
-    # Section 5 — Summary
-    # ---------------------------------------------------------
-    st.header("5. Summary")
-    # add a little extra spacing for readability
-    st.write("\n")
-    if "anomaly" in df.columns:
-        counts = df["anomaly"].value_counts().rename(index={1:"normal", -1:"anomaly"})
-        total = counts.sum()
-        anom = counts.get(-1, 0)
-        pct = anom / total * 100 if total > 0 else 0
-        st.markdown(
-            f"""**Total records:** {total}  
-**Anomalies detected:** {anom} ({pct:.1f}% of data)"""
-        )
-        if anom > 0:
-            st.markdown("**Sample anomalous rows:**")
-            st.dataframe(df[df["anomaly"] == -1].head())
-        st.markdown(
-            "_These numbers are also shown above; adjust contamination or examine data quality to change them._"
-        )
-    else:
-        st.markdown("No anomaly results yet. Run the detection toggle in Section 4 to generate a summary.")
+            if temp_col is None or hum_col is None:
+                st.warning("Required temperature or humidity columns not found in dataset.")
+            else:
+                temp_series = tuple(trimmed[temp_col].astype('float32', errors='ignore').tolist())
+                hum_series = tuple(trimmed[hum_col].astype('float32', errors='ignore').tolist())
+                time_series = tuple(pd.to_datetime(trimmed["date"], errors='coerce').tolist()) if "date" in trimmed.columns else tuple()
+                anomaly_series = tuple(trimmed["anomaly"].map({1: 'Normal', -1: 'Anomaly'}).fillna('Normal').tolist()) if "anomaly" in trimmed.columns else tuple()
+
+                # line charts side-by-side
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.subheader("Temperature Over Time")
+                    temperature_fig = get_temperature_plot(temp_col, temp_series, selected_city, time_series)
+                    if temperature_fig is not None:
+                        st.plotly_chart(temperature_fig, use_container_width=True)
+
+                with c2:
+                    st.subheader("Humidity Over Time")
+                    humidity_fig = get_humidity_plot(hum_col, hum_series, selected_city, time_series)
+                    if humidity_fig is not None:
+                        st.plotly_chart(humidity_fig, use_container_width=True)
+
+                # scatter and anomaly side-by-side with equal width
+                c3, c4 = st.columns([1, 1])
+                with c3:
+                    st.subheader("Temperature vs Humidity")
+                    scatter_fig = get_scatter_plot(temp_col, hum_col, temp_series, hum_series, selected_city)
+                    if scatter_fig is not None:
+                        st.plotly_chart(scatter_fig, use_container_width=True)
+
+                st.markdown("---")
+
+                if "anomaly" in df.columns:
+                    with c4:
+                        st.subheader("Anomaly Scan")
+                        anomaly_fig = get_anomaly_scatter_plot(temp_col, hum_col, temp_series, hum_series, anomaly_series, selected_city)
+                        if anomaly_fig is not None:
+                            st.plotly_chart(anomaly_fig, use_container_width=True)
+                        st.metric("Normal count", f"{normal_counts:,}")
+                        st.metric("Anomaly count", f"{anomaly_counts:,}")
+                        st.caption("Anomalies marked by IsolationForest: -1 = anomaly, 1 = normal")
+
+                        st.markdown("#### Anomaly sample rows")
+                        anomaly_rows = trimmed[trimmed["anomaly"] == -1]
+                        if not anomaly_rows.empty:
+                            display_cols = [c for c in ["date", temp_col, hum_col, "wind_speed", "temp_change", "humidity_change", "is_anomaly"] if c in anomaly_rows.columns]
+                            st.dataframe(anomaly_rows[display_cols].head(10).reset_index(drop=True))
+                        else:
+                            st.write("No anomaly rows in the plotted subset.")
